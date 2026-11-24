@@ -54,6 +54,13 @@ rex.bind("alt+shift+i", "rex_grab", { verb = "insert" })
 Then `rex config reload`. The plugin binds no keys of its own; bind the verbs
 you want. **Grab: URL or File…** is also in the command palette (it opens).
 
+## Update
+
+```sh
+git -C ~/.config/rex/rex-grab pull
+rex config reload
+```
+
 ## Verbs
 
 | Verb | What happens to the pick |
