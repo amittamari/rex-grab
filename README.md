@@ -4,6 +4,8 @@ Pick a URL or file path from a [Rex](https://www.superlogical.com/rex) pane's
 output, in Rex's own command palette, then open it, copy it, or type it into
 the pane.
 
+https://github.com/user-attachments/assets/9b79c4ba-139f-4a32-9abc-4da1cd95350e
+
 Say an agent in the focused pane just printed:
 
 ```
