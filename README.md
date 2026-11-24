@@ -36,9 +36,6 @@ Type to filter, Enter to act on the pick, Escape to cancel.
   fzf in a popup.
 - **Configurable.** You choose what counts as a target and what opens it.
 
-If you'd rather label what's on screen with hint letters, tmux-fingers style,
-see [rex-hints](https://github.com/jmayaalv/rex-hints).
-
 ## Install
 
 ```sh
