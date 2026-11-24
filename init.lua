@@ -6,7 +6,11 @@ local M = {}
 
 local term = "com.superlogical.terminal"
 local uname = rex.exec{ "uname" }
-local OPEN = uname and uname.ok and uname.stdout:match("^Darwin") and "open" or "xdg-open"
+local darwin = uname and uname.ok and uname.stdout:match("^Darwin")
+local OPEN = darwin and "open" or "xdg-open"
+local COPY = darwin and { "pbcopy" }
+  or os.getenv("WAYLAND_DISPLAY") and { "wl-copy" }
+  or { "xclip", "-selection", "clipboard" }
 
 M.defaults = {
   kinds = {
@@ -23,22 +27,38 @@ M.defaults = {
       open = { OPEN, "{}" },
     },
   },
-  copy = { "pbcopy" },
+  copy = COPY,
 }
 
-local function is_file(path)
+local function opens(path)
   local f = io.open(path, "r")
-  if f == nil then return false end
-  local _, err = f:read(0) -- a directory opens, then fails to read
-  f:close()
-  return err == nil
+  if f then f:close() end
+  return f ~= nil
+end
+
+-- A directory opens for reading too, but only a directory opens with a
+-- trailing slash.
+local function is_file(path)
+  return opens(path) and not opens(path .. "/")
+end
+
+-- An absolute path without "." and ".." segments or doubled slashes, so one
+-- file printed in several spellings is listed once.
+local function clean(path)
+  local segs = {}
+  for seg in path:gmatch("[^/]+") do
+    if seg == ".." then segs[#segs] = nil
+    elseif seg ~= "." then segs[#segs + 1] = seg end
+  end
+  return "/" .. table.concat(segs, "/")
 end
 
 -- The pane's screen and scrollback as text. One reply holds at most 960 KiB,
 -- oldest text first. When the pane has more, read its last 960 KiB instead:
 -- the things worth grabbing are the recent ones. max_bytes counts
 -- JSON-escaped bytes, so a read can stop short of the end; keep reading
--- until eof.
+-- until eof. A tail read starts partway through a line, so its first line is
+-- dropped.
 local function screen_text(block_id)
   local limit = 983040
   local screen = rex.block.call(term, "format",
@@ -46,6 +66,7 @@ local function screen_text(block_id)
   if screen == nil then return "" end
   if screen.id == nil then return screen.content end
   local parts, offset = {}, math.max(0, screen.total - limit)
+  local tail = offset > 0
   repeat
     local r = rex.block.call(term, "blob_read",
       { block_id = block_id, id = screen.id, offset = offset, max_bytes = limit })
@@ -53,7 +74,9 @@ local function screen_text(block_id)
     parts[#parts + 1] = r.data
     offset = offset + #r.data
   until r.eof
-  return table.concat(parts)
+  local text = table.concat(parts)
+  if tail then text = text:gsub("^[^\n]*\n", "") end
+  return text
 end
 
 -- argv with every "{}" replaced by target.
@@ -90,6 +113,11 @@ function M.setup(opts)
     if fa ~= fb then return fa < fb end
     return a < b
   end)
+  -- A kind without find only lists repo files.
+  local scan = {}
+  for _, name in ipairs(order) do
+    if kinds[name].find then scan[#scan + 1] = name end
+  end
 
   local copy = opts.copy or M.defaults.copy
   -- The Rex server runs with a bare PATH; take the login shell's, as Rex
@@ -107,21 +135,32 @@ function M.setup(opts)
     args = { verb = "string?" },
     run = function(ctx, args)
       local verb = args.verb or "open"
+      if verb ~= "open" and verb ~= "copy" and verb ~= "insert" then
+        error("rex_grab: unknown verb " .. verb .. " (open, copy or insert)", 0)
+      end
       local p = rex.block.call(term, "process", { block_id = ctx.block_id })
       local cwd = p and p.foreground and p.foreground.cwd or os.getenv("HOME")
-      local g = rex.exec({ "git", "rev-parse", "--show-toplevel" }, { cwd = cwd })
-      local root = g and g.ok and g.stdout:gsub("%s+$", "") or nil
+      local g = rex.exec({ "git", "rev-parse", "--show-toplevel", "--show-prefix" }, { cwd = cwd })
+      local root, prefix
+      if g and g.ok then root, prefix = g.stdout:match("^([^\n]+)\n([^\n]*)") end
+      -- git resolves symlinks in the root; spell cwd the same way, so a file
+      -- found in the pane and the same file from ls-files have one path.
+      if root then cwd = (root .. "/" .. prefix):gsub("/$", "") end
 
       local items, found, seen = {}, {}, {}
-      local function add(target, name, title, icon)
+      local function add(target, name, title, icon, subtitle)
         if seen[target] or #items >= 2000 then return end
         seen[target] = true
         found[target] = name
-        items[#items + 1] = { id = target, title = title, icon = icon, detail = name }
+        items[#items + 1] = { id = target, title = title, subtitle = subtitle, icon = icon, detail = name }
       end
       local function add_file(abs, name, icon)
         local base = root and abs:sub(1, #root + 1) == root .. "/" and root .. "/" or ""
-        add(abs, name, abs:sub(#base + 1), icon)
+        -- The palette cuts a long title at its end, so the title is the file
+        -- name and the directory goes on the second line.
+        local rel = abs:sub(#base + 1)
+        local dir, file = rel:match("^(.*)/([^/]+)$")
+        add(abs, name, file or rel, icon, dir)
       end
 
       local lines = {}
@@ -130,7 +169,7 @@ function M.setup(opts)
       end
       for i = #lines, 1, -1 do
         local line = lines[i]
-        for _, name in ipairs(order) do
+        for _, name in ipairs(scan) do
           local k = kinds[name]
           for m in line:gmatch(k.find) do
             if not k.file then
@@ -141,6 +180,7 @@ function M.setup(opts)
                 or m:sub(1, 2) == "~/" and { os.getenv("HOME") .. m:sub(2) }
                 or { cwd .. "/" .. m, root and root .. "/" .. m }
               for _, c in ipairs(candidates) do
+                c = clean(c)
                 if is_file(c) then add_file(c, name, "star"); break end
               end
             end
@@ -153,8 +193,8 @@ function M.setup(opts)
         for _, name in ipairs(order) do
           local k = kinds[name]
           if k.repo then
-            local r = rex.exec({ "git", "ls-files", "--", k.repo }, { cwd = root })
-            for rel in ((r and r.ok and r.stdout) or ""):gmatch("[^\n]+") do
+            local r = rex.exec({ "git", "ls-files", "-z", "--", k.repo }, { cwd = root })
+            for rel in ((r and r.ok and r.stdout) or ""):gmatch("[^%z]+") do
               add_file(root .. "/" .. rel, name, k.icon or "document")
             end
           end
@@ -168,19 +208,27 @@ function M.setup(opts)
       if verb == "insert" then
         -- Relative to the pane's cwd when inside it, as typed paths would be.
         local text = target:sub(1, #cwd + 1) == cwd .. "/" and target:sub(#cwd + 2) or target
+        -- A path a shell would split or expand is single-quoted.
+        if kinds[found[target]].file and text:find("[^%w%._%-/~+,:@=]") then
+          text = "'" .. text:gsub("'", "'\\''") .. "'"
+        end
         rex.block.call(term, "write", { block_id = ctx.block_id, data = text })
       elseif verb == "copy" then
-        local r, err = rex.exec(copy, { stdin = target, env = { PATH = path } })
-        if r == nil or not r.ok then error("copy: " .. (err or r.stderr), 0) end
+        -- Output isn't captured: xclip and wl-copy stay running to serve the
+        -- clipboard, and would hold the pipes open.
+        local r, err = rex.exec(copy,
+          { stdin = target, env = { PATH = path }, stdout = false, stderr = false })
+        if r == nil or not r.ok then
+          error("copy: " .. (err or copy[1] .. " exited with " .. r.code), 0)
+        end
       elseif verb == "open" then
         local open = kinds[found[target]].open
+        if open == nil then error("rex_grab: kind " .. found[target] .. " has no open command", 0) end
         if type(open) == "function" then return open(target, ctx) end
         local argv = fill(open, target)
         local h, err = rex.exec.start(argv,
           { env = { PATH = path }, detach = true, stdout = false, stderr = false })
         if h == nil then error(argv[1] .. ": " .. err, 0) end
-      else
-        error("rex_grab: unknown verb " .. verb .. " (open, copy or insert)", 0)
       end
     end,
   }
